@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ネオン円形スペクトラム — Ultimate Visualizer</title>
+<style>
+  :root{--panel-bg:rgba(0,0,0,0.45);--accent:#0ff;}
+  html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN",sans-serif}
+  #canvas{display:block;width:100vw;height:100vh}
+  #ui{
+    position:fixed;left:12px;top:12px;z-index:30;padding:10px;border-radius:10px;background:var(--panel-bg);
+    backdrop-filter: blur(6px);box-shadow:0 6px 24px rgba(0,0,0,0.6);min-width:260px
+  }
+  #ui label{display:block;font-size:13px;margin:6px 0 3px}
+  input[type="range"]{width:100%}
+  .row{display:flex;gap:8px;align-items:center}
+  .small{font-size:12px;color:#ddd}
+  #title{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;z-index:10}
+  #trackTitle{font-size:20px;font-weight:700;letter-spacing:0.6px;text-shadow:0 8px 28px rgba(0,255,255,0.06)}
+  #artist{font-size:14px;opacity:0.85}
+  button{background:transparent;border:1px solid rgba(255,255,255,0.08);color:#fff;padding:6px 8px;border-radius:8px;cursor:pointer}
+  .muted{opacity:0.6}
+  .help{font-size:12px;color:#bbb;margin-top:6px}
+  input[type="file"]{color:transparent}
+  #bottomControls{position:fixed;right:12px;bottom:12px;padding:10px;border-radius:10px;background:var(--panel-bg);backdrop-filter: blur(6px)}
+  .toggle{display:inline-flex;gap:6px;align-items:center}
+</style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div id="ui">
+    <label>Audio file</label>
+    <div class="row">
+      <input id="fileAudio" type="file" accept="audio/*">
+      <button id="playPause" class="muted">Play</button>
+    </div>
+
+    <label>Background</label>
+    <div class="row">
+      <select id="bgMode" title="背景モード">
+        <option value="gradient">Gradient（デフォルト）</option>
+        <option value="image">Image</option>
+        <option value="dark">Dark</option>
+      </select>
+      <input id="bgImage" type="file" accept="image/*" title="背景画像を選択">
+    </div>
+
+    <label>Controls</label>
+    <div class="row small">
+      <div style="flex:1">
+        <div>Rotation speed</div>
+        <input id="rotSpeed" type="range" min="-0.02" max="0.02" step="0.0005" value="0.0025">
+      </div>
+      <div style="width:10px"></div>
+      <div style="flex:1">
+        <div>Glow</div>
+        <input id="glow" type="range" min="0" max="60" step="1" value="22">
+      </div>
+    </div>
+
+    <div class="row small" style="margin-top:8px">
+      <div style="flex:1">
+        <div>Inner radius</div>
+        <input id="innerRadius" type="range" min="40" max="360" step="1" value="140">
+      </div>
+      <div style="width:10px"></div>
+      <div style="flex:1">
+        <div>Outer multiplier</div>
+        <input id="outerMul" type="range" min="0.8" max="3.5" step="0.05" value="2.0">
+      </div>
+    </div>
+
+    <label>Visual toggles</label>
+    <div class="row small">
+      <label class="toggle"><input id="showPulse" type="checkbox" checked> Pulse</label>
+      <label class="toggle"><input id="showRing" type="checkbox" checked> Inner ring</label>
+      <label class="toggle"><input id="blendAdd" type="checkbox" checked> Additive blend</label>
+    </div>
+
+    <div class="help">Tip: 音声ファイルを選択してからブラウザの再生許可を与えてください（初回はユーザー操作が必要な場合があります）。</div>
+  </div>
+
+  <div id="bottomControls">
+    <div class="small">Volume</div>
+    <input id="volume" type="range" min="0" max="1" step="0.01" value="1">
+  </div>
+
+  <div id="title">
+    <div id="trackTitle" style="color:#aef;filter:drop-shadow(0 6px 18px rgba(80,220,255,0.06))">No track loaded</div>
+    <div id="artist" class="small">—</div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('canvas'), ctx = canvas.getContext('2d');
+  let W = canvas.width = innerWidth, H = canvas.height = innerHeight;
+  window.addEventListener('resize', () => { W = canvas.width = innerWidth; H = canvas.height = innerHeight; });
+
+  // UI elems
+  const fileAudio = document.getElementById('fileAudio');
+  const playPause = document.getElementById('playPause');
+  const bgMode = document.getElementById('bgMode');
+  const bgImageInput = document.getElementById('bgImage');
+  const rotSpeedUI = document.getElementById('rotSpeed');
+  const glowUI = document.getElementById('glow');
+  const innerRadiusUI = document.getElementById('innerRadius');
+  const outerMulUI = document.getElementById('outerMul');
+  const showPulseUI = document.getElementById('showPulse');
+  const showRingUI = document.getElementById('showRing');
+  const blendAddUI = document.getElementById('blendAdd');
+  const volumeUI = document.getElementById('volume');
+  const trackTitle = document.getElementById('trackTitle');
+  const artistEl = document.getElementById('artist');
+
+  // Audio
+  let audioEl = null;
+  let audioCtx = null, analyser = null, sourceNode = null;
+  let freqData, timeData, fftSize = 2048;
+  let smoothed = null;
+  let rotation = 0;
+
+  // Background image
+  let bgImg = null;
+
+  // default params
+  let params = {
+    rotationSpeed: parseFloat(rotSpeedUI.value),
+    glow: parseFloat(glowUI.value),
+    innerRadius: parseFloat(innerRadiusUI.value),
+    outerMul: parseFloat(outerMulUI.value),
+  };
+
+  // helpers
+  function lerp(a,b,t){return a + (b-a)*t}
+  function clamp(x,a,b){return Math.max(a,Math.min(b,x))}
+
+  // map frequency index to hue: low=red(0) -> mid=purple(280) -> high=blue(220)
+  function freqToHue(norm) {
+    // piecewise: 0..0.5 -> 0..280, 0.5..1 -> 280..220
+    if (norm < 0.5) {
+      return lerp(0, 280, norm/0.5);
+    } else {
+      return lerp(280, 220, (norm-0.5)/0.5);
+    }
+  }
+
+  // load image
+  bgImageInput.addEventListener('change', (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const img = new Image();
+    img.onload = () => { bgImg = img; };
+    img.src = URL.createObjectURL(f);
+  });
+
+  // audio file
+  fileAudio.addEventListener('change', (e)=>{
+    const f = e.target.files[0]; if(!f) return;
+    // cleanup previous
+    if (audioEl) { audioEl.pause(); audioEl.src = ''; audioEl.remove(); audioEl = null; }
+    // create audio element
+    audioEl = new Audio();
+    audioEl.crossOrigin = "anonymous";
+    audioEl.src = URL.createObjectURL(f);
+    audioEl.loop = true;
+    audioEl.controls = false;
+    audioEl.autoplay = true;
+    audioEl.volume = parseFloat(volumeUI.value);
+    document.body.appendChild(audioEl);
+
+    // set title from filename (best-effort)
+    trackTitle.textContent = decodeURIComponent(f.name.replace(/\.[^/.]+$/,""));
+    artistEl.textContent = "—";
+
+    // audio context
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    // create nodes
+    if (sourceNode) sourceNode.disconnect();
+    sourceNode = audioCtx.createMediaElementSource(audioEl);
+    if (analyser) analyser.disconnect();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = fftSize; // high resolution for nicer waveform
+    const bufferLength = analyser.frequencyBinCount;
+    freqData = new Uint8Array(bufferLength);
+    timeData = new Uint8Array(analyser.fftSize);
+    smoothed = new Float32Array(bufferLength);
+
+    // connect
+    sourceNode.connect(analyser);
+    analyser.connect(audioCtx.destination);
+
+    // play/pause state
+    playPause.textContent = 'Pause';
+    playPause.classList.remove('muted');
+
+    // try resume (user gesture)
+    if (audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+  });
+
+  // play/pause button
+  playPause.addEventListener('click', ()=>{
+    if (!audioEl) return;
+    if (audioEl.paused) { audioEl.play(); playPause.textContent = 'Pause'; playPause.classList.remove('muted'); }
+    else { audioEl.pause(); playPause.textContent = 'Play'; playPause.classList.add('muted'); }
+  });
+
+  // volume control
+  volumeUI.addEventListener('input', ()=>{ if (audioEl) audioEl.volume = parseFloat(volumeUI.value); });
+
+  // UI sliders
+  rotSpeedUI.addEventListener('input', ()=> params.rotationSpeed = parseFloat(rotSpeedUI.value));
+  glowUI.addEventListener('input', ()=> params.glow = parseFloat(glowUI.value));
+  innerRadiusUI.addEventListener('input', ()=> params.innerRadius = parseFloat(innerRadiusUI.value));
+  outerMulUI.addEventListener('input', ()=> params.outerMul = parseFloat(outerMulUI.value));
+
+  // drawing loop
+  function draw() {
+    requestAnimationFrame(draw);
+    // clear
+    ctx.clearRect(0,0,W,H);
+
+    // background
+    const bgModeVal = bgMode.value;
+    // compute global amplitude for background/pulse (use time domain)
+    let masterAmp = 0;
+    if (analyser && timeData) {
+      analyser.getByteTimeDomainData(timeData);
+      // compute RMS-ish amplitude
+      let sum = 0;
+      for (let i=0;i<timeData.length;i++){
+        const v = (timeData[i]-128)/128;
+        sum += v*v;
+      }
+      masterAmp = Math.sqrt(sum / timeData.length); // 0..1
+    }
+
+    // draw background choices
+    if (bgModeVal === 'gradient') {
+      // animated radial gradient (neon-ish)
+      const g = ctx.createLinearGradient(0,0,W,H);
+      // subtle color movement using time
+      const t = performance.now()/6000;
+      const c1 = `hsl(${(200 + t*40)%360}, 60%, ${clamp(12 + masterAmp*18,6,30)}%)`; // dark bluish
+      const c2 = `hsl(${(300 + t*20)%360}, 60%, ${clamp(2 + masterAmp*38,2,18)}%)`;
+      g.addColorStop(0,c1);
+      g.addColorStop(1,c2);
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,W,H);
+      // slight flash based on masterAmp
+      ctx.fillStyle = `rgba(255,255,255,${masterAmp*0.06})`;
+      ctx.fillRect(0,0,W,H);
+    } else if (bgModeVal === 'image' && bgImg) {
+      // draw background image scaled cover
+      const img = bgImg;
+      const iw = img.width, ih = img.height;
+      const r = Math.max(W/iw, H/ih);
+      const dw = iw * r, dh = ih * r;
+      const ox = (W - dw)/2, oy = (H - dh)/2;
+      ctx.globalAlpha = 0.85;
+      ctx.drawImage(img, ox, oy, dw, dh);
+      ctx.globalAlpha = 1.0;
+      // dark overlay to make neon pop; modulate brightness with masterAmp
+      ctx.fillStyle = `rgba(0,0,0,${0.35 - masterAmp*0.22})`;
+      ctx.fillRect(0,0,W,H);
+    } else {
+      // dark plain
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0,0,W,H);
+    }
+
+    // set blending mode for neon additive
+    if (blendAddUI.checked) ctx.globalCompositeOperation = 'lighter';
+    else ctx.globalCompositeOperation = 'source-over';
+
+    // return if no audio
+    if (!analyser || !freqData) return;
+
+    // get frequency data
+    analyser.getByteFrequencyData(freqData);
+
+    const cx = W/2, cy = H/2;
+    const baseRadius = params.innerRadius;
+    const outerRadius = baseRadius * params.outerMul;
+
+    // rotation update
+    rotation += params.rotationSpeed;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rotation);
+
+    // draw outer ring and inner ring (two passes)
+    const bufferLength = freqData.length;
+    for (let pass=0; pass<2; pass++){
+      const passInner = (pass===0); // inner ring pass first
+      const rad = passInner ? baseRadius : lerp(baseRadius + 8, outerRadius, 1);
+      const thickness = passInner ? 1.8 : 2.6;
+      const mult = passInner ? 1.0 : 1.0;
+
+      for (let i=0;i<bufferLength;i++){
+        // smoothing for inertia
+        smoothed[i] += (freqData[i] - smoothed[i]) * 0.18;
+
+        const value = smoothed[i] * mult * (passInner ? 1.0 : 1.9);
+        const norm = i / bufferLength;
+        const angle = norm * Math.PI * 2;
+        const x1 = Math.cos(angle) * rad;
+        const y1 = Math.sin(angle) * rad;
+        const x2 = Math.cos(angle) * (rad + value);
+        const y2 = Math.sin(angle) * (rad + value);
+
+        // color by frequency (low->red; mid->purple; high->blue)
+        const hue = freqToHue(norm);
+        const light = clamp(50 + value*0.08, 40, 70);
+        const stroke = `hsl(${hue}, 100%, ${light}%)`;
+
+        ctx.lineWidth = thickness;
+        // neon glow
+        ctx.shadowBlur = params.glow * (passInner ? 0.7 : 1.0);
+        ctx.shadowColor = stroke;
+        ctx.strokeStyle = stroke;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+    ctx.shadowBlur = 0; // reset
+
+    // central pulse
+    if (showPulseUI.checked) {
+      const pulseSize = baseRadius * 0.6 + masterAmp * 220;
+      const pulseAlpha = clamp(0.12 + masterAmp * 0.9, 0.04, 0.92);
+      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, pulseSize*1.6);
+      g.addColorStop(0, `rgba(255,255,255,${pulseAlpha*0.7})`);
+      g.addColorStop(0.3, `rgba(160,220,255,${pulseAlpha*0.3})`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.globalCompositeOperation = 'screen';
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(cx, cy, pulseSize, 0, Math.PI*2);
+      ctx.fill();
+      ctx.globalCompositeOperation = blendAddUI.checked ? 'lighter' : 'source-over';
+    }
+
+    // optional inner static ring
+    if (showRingUI.checked) {
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(-rotation*0.6); // slight counter-rotation for depth
+      ctx.lineWidth = 1.2;
+      ctx.globalAlpha = 0.6;
+      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      ctx.beginPath();
+      ctx.arc(0,0, baseRadius-6, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.restore();
+      ctx.globalAlpha = 1.0;
+    }
+
+    // Title pulsing (scale with masterAmp)
+    const titleScale = 1 + masterAmp*0.14;
+    trackTitle.style.transform = `translate(-50%,-50%) scale(${titleScale})`;
+    trackTitle.style.opacity = clamp(0.45 + masterAmp*1.6, 0.5, 1.0);
+
+  } // draw()
+
+  // start animation
+  requestAnimationFrame(draw);
+
+  // small UX: allow spacebar to play/pause
+  window.addEventListener('keydown', (e)=>{
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (audioEl) { if (audioEl.paused) audioEl.play(); else audioEl.pause(); playPause.textContent = audioEl.paused? 'Play' : 'Pause'; }
+    }
+  });
+
+  // initialize UI values
+  params.rotationSpeed = parseFloat(rotSpeedUI.value);
+  params.glow = parseFloat(glowUI.value);
+  params.innerRadius = parseFloat(innerRadiusUI.value);
+  params.outerMul = parseFloat(outerMulUI.value);
+
+  // hint: mobile considerations (start audio from user gesture)
+  canvas.addEventListener('click', async () => {
+    if (audioCtx && audioCtx.state === 'suspended') {
+      try { await audioCtx.resume(); } catch(e) {}
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
